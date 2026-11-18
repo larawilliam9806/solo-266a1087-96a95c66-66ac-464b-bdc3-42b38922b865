@@ -11,7 +11,10 @@ import hashlib
 import http.cookiejar
 import json
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -103,6 +106,18 @@ class Client:
 
     def run_query(self, sql):
         return self.call("POST", "/query", {"sql": sql})
+
+    def export(self):
+        """POST /export：成功返回 (200, headers, 文件字节)，失败返回 (状态码, headers, dict)。"""
+        req = urllib.request.Request(self.base + "/export", data=b"", method="POST")
+        try:
+            with self.opener.open(req, timeout=60) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, dict(e.headers), json.loads(e.read().decode())
+            except Exception:
+                return e.code, dict(e.headers), {}
 
     def wait_final(self, job_id, timeout=20.0):
         t0 = time.monotonic()
@@ -257,6 +272,107 @@ def main():
     check("use-demo 可用", st == 200 and j.get("ok"), f"got {st} {j}")
     st, j = c4.call("GET", "/schema")
     check("演示库表结构可读", st == 200 and any(t["name"] == "sensor_samples" for t in j.get("tables", [])))
+
+    print("== 代号化导出（HTTP 端到端） ==")
+    cexp = Client(base)
+    st, _h, j = cexp.export()
+    check("未加载副本时导出被拒绝", st == 400 and "error" in j, f"got {st} {j}")
+    st, _ = cexp.upload(demo_db, "demo_sensors.db")
+    assert st == 200
+    # 导出前先记录原副本哈希，导出后核对原副本未被改动、仍可查询
+    before_hash = sha256(demo_db)
+    st, headers, payload = cexp.export()
+    check("导出成功返回文件流", st == 200 and isinstance(payload, (bytes, bytearray)) and len(payload) > 100,
+          f"got {st}")
+    check("下载文件名正确", headers.get("Content-Disposition", "").find("sensors_coded.db") >= 0,
+          headers.get("Content-Disposition"))
+    check("响应头携带导出统计", headers.get("X-Export-Sensors") == "6"
+          and headers.get("X-Export-Samples") == "13260",
+          f"{headers.get('X-Export-Sensors')}/{headers.get('X-Export-Samples')}")
+
+    with tempfile.TemporaryDirectory() as td:
+        out_db = os.path.join(td, "out.db")
+        with open(out_db, "wb") as fh:
+            fh.write(payload)
+        oc = sqlite3.connect(out_db)
+        n_sensors = oc.execute("SELECT COUNT(*) FROM sensors").fetchone()[0]
+        n_samples = oc.execute("SELECT COUNT(*) FROM sensor_samples").fetchone()[0]
+        n_hidden = oc.execute("SELECT COUNT(*) FROM sensors WHERE location='已隐藏'").fetchone()[0]
+        n_codes = oc.execute("SELECT COUNT(DISTINCT sensor_id) FROM sensors").fetchone()[0]
+        n_fk = len(oc.execute("PRAGMA foreign_key_check").fetchall())
+        integrity = oc.execute("PRAGMA integrity_check").fetchone()[0]
+        dup_groups = oc.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM sensor_samples "
+            "GROUP BY sensor_id, ts HAVING COUNT(*)>1)"
+        ).fetchone()[0]
+        sample_codes = {r[0] for r in oc.execute("SELECT DISTINCT sensor_id FROM sensor_samples")}
+        sensor_codes = {r[0] for r in oc.execute("SELECT sensor_id FROM sensors")}
+        # 主外键关系保留：samples 的代号全部能在 sensors 中找到
+        check("成品行数与原库一致", n_sensors == 6 and n_samples == 13260, f"{n_sensors}/{n_samples}")
+        check("位置全部已隐藏", n_hidden == 6, str(n_hidden))
+        check("代号唯一", n_codes == 6, str(n_codes))
+        check("外键关系完好且完整性 OK", n_fk == 0 and integrity == "ok")
+        check("重复次数保留（270 组）", dup_groups == 270, str(dup_groups))
+        check("两表代号同步改写", sample_codes == sensor_codes and len(sample_codes) == 6)
+        oc.close()
+
+        raw = payload
+        check("成品字节无原编号残留", all(sid.encode() not in raw for sid in
+              ("S-1001", "S-1002", "S-2001", "S-2002", "S-3001", "S-3002")))
+        check("成品字节无原位置残留", all(loc.encode() not in raw for loc in
+              ("车间A", "车间B", "冷库")))
+        check("成品为合法 SQLite 文件", raw[:16] == b"SQLite format 3\x00")
+        check("成品无 WAL/SHM 旁路", not os.path.exists(out_db + "-wal")
+              and not os.path.exists(out_db + "-shm"))
+
+        # 原副本仍可查询且字节未变
+        st2, qj = cexp.run_query("SELECT COUNT(*) FROM sensor_samples")
+        qj = cexp.wait_final(qj["job_id"])
+        check("导出后原副本仍可查询", qj["status"] == "done" and qj["rows"][0][0] == 13260, str(qj)[:120])
+
+    # 通过服务端 uploads 目录核对该会话副本未被改写
+    st, cur = cexp.call("GET", "/api/current")
+    check("导出后当前副本仍处于加载状态", cur.get("loaded") is True)
+    check("服务端上传目录无导出半成品残留",
+          all(not f.startswith("export-") for f in os.listdir(upload_dir)),
+          str([f for f in os.listdir(upload_dir) if f.startswith("export-")]))
+
+    # 构造各类应被拒绝的库
+    def variant(name, fn):
+        p = os.path.join(tempfile.mkdtemp(), name)
+        shutil.copyfile(demo_db, p)
+        cc = sqlite3.connect(p)
+        fn(cc)
+        cc.commit()
+        cc.close()
+        return p
+
+    def reject_case(label, path):
+        cc2 = Client(base)
+        st, _ = cc2.upload(path, "bad.db")
+        assert st == 200, f"upload {label}: {st}"
+        st2, _h, body = cc2.export()
+        check(label, st2 == 400 and isinstance(body, dict) and body.get("error"),
+              f"got {st2} {str(body)[:120]}")
+
+    reject_case("额外用户表被拒绝", variant("t.db",
+                lambda cc: cc.execute("CREATE TABLE user_extra(x TEXT)")))
+    reject_case("视图被拒绝", variant("v.db",
+                lambda cc: cc.execute("CREATE VIEW v_s AS SELECT * FROM sensors")))
+    reject_case("触发器被拒绝", variant("g.db",
+                lambda cc: cc.execute("CREATE TRIGGER trg AFTER INSERT ON sensors BEGIN SELECT 1; END")))
+    reject_case("保留字段含原编号被拒绝", variant("l1.db",
+                lambda cc: cc.execute("UPDATE sensor_samples SET batch_id='S-1001-leak' WHERE id=1")))
+    reject_case("保留字段含原位置被拒绝", variant("l2.db",
+                lambda cc: cc.execute("UPDATE sensors SET metric=metric||'冷库' WHERE sensor_id='S-1001'")))
+
+    big = os.path.join(tempfile.mkdtemp(), "big.db")
+    shutil.copyfile(demo_db, big)
+    with open(big, "ab") as fh:
+        fh.write(b"\0" * (10 * 1024 * 1024 + 1))
+    reject_case("超过 10MB 被拒绝", big)
+
+    check("演示库本身未被测试污染", sha256(demo_db) == before_hash)
 
     print()
     print(f"共 {checks[0]} 项检查，失败 {len(failures)} 项")

@@ -72,8 +72,23 @@
     <div id="schemaBox"><span class="muted">加载中…</span></div>
   </section>
 
+  <section class="card" id="exportCard" style="display:none">
+    <h2>③ 代号化导出（外发协作方）</h2>
+    <p class="muted" style="margin:0 0 10px">
+      生成可外发的脱敏副本：每个设备编号替换为唯一随机代号（两表同步改写），安装位置统一替换为「已隐藏」，
+      其余采样字段、主外键关系与重复次数原样保留。仅受理 <b>≤ 10MB</b>、与演示库同结构的
+      <code>sensors</code> / <code>sensor_samples</code> 两表库；含额外表、视图、触发器，
+      或保留字段中夹带原编号/位置的库将被拒绝。导出基于受理瞬间的完整快照，不影响当前可查询的原副本。
+    </p>
+    <div class="row">
+      <button id="exportBtn">生成并下载代号化副本</button>
+      <span id="exportStatus" class="muted"></span>
+    </div>
+    <div id="exportBanner" class="banner"></div>
+  </section>
+
   <section class="card" id="queryCard" style="display:none">
-    <h2>③ 只读查询</h2>
+    <h2>④ 只读查询</h2>
     <div class="row examples" style="margin-bottom:8px">
       <span class="muted">示例：</span>
       <button data-ex="dup">重复采样汇总</button>
@@ -146,11 +161,13 @@ async function refreshCurrent() {
   if (body.loaded) {
     setDbStatus(`已加载副本（${(body.size/1024).toFixed(1)} KB）。所有查询均为只读，不影响原库。`);
     $('schemaCard').style.display = '';
+    $('exportCard').style.display = '';
     $('queryCard').style.display = '';
     loadSchema();
   } else {
     setDbStatus('尚未加载数据库。');
     $('schemaCard').style.display = 'none';
+    $('exportCard').style.display = 'none';
     $('queryCard').style.display = 'none';
   }
 }
@@ -177,7 +194,47 @@ $('resetBtn').onclick = async () => {
   await api('POST', '/reset');
   setDbStatus('副本已清除。');
   $('schemaCard').style.display = 'none';
+  $('exportCard').style.display = 'none';
   $('queryCard').style.display = 'none';
+};
+
+function exportBanner(kind, msg) {
+  const b = $('exportBanner');
+  b.className = 'banner show ' + kind;
+  b.textContent = msg;
+}
+
+$('exportBtn').onclick = async () => {
+  const btn = $('exportBtn');
+  btn.disabled = true;
+  $('exportStatus').textContent = '正在生成代号化副本…';
+  exportBanner('run', '处理中：快照、结构校验、代号改写与残留复核完成后才会开始下载。');
+  try {
+    const resp = await fetch('/export', { method: 'POST' });
+    if (!resp.ok) {
+      let msg = '导出失败（' + resp.status + '）';
+      try { const j = await resp.json(); if (j.error) msg = j.error; } catch (e) {}
+      exportBanner('err', msg);
+      $('exportStatus').textContent = '已拒绝导出。';
+      return;
+    }
+    // 只有后端全流程成功才会返回文件流；任何校验失败均为 JSON 错误，无半成品下载
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'sensors_coded.db';
+    document.body.append(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    const nSensors = resp.headers.get('X-Export-Sensors') || '?';
+    const nSamples = resp.headers.get('X-Export-Samples') || '?';
+    exportBanner('ok', `导出成功：已代号化 ${nSensors} 个设备、${nSamples} 条采样，原副本未被修改，仍可继续查询。`);
+    $('exportStatus').textContent = '';
+  } catch (e) {
+    exportBanner('err', '导出请求失败：' + e);
+    $('exportStatus').textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 async function loadSchema() {

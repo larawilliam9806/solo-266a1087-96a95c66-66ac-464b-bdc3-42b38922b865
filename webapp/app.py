@@ -1,16 +1,18 @@
-"""传感器入库排查页：浏览器上传 SQLite 副本，只读执行 SELECT/WITH 查询。"""
+"""传感器入库排查页：上传 SQLite 副本，只读执行 SELECT/WITH 查询，并支持代号化脱敏导出。"""
 from __future__ import annotations
 
 import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
 
-from flask import Flask, jsonify, render_template, request, send_file, session
+from flask import Flask, after_this_request, jsonify, render_template, request, send_file, session
 
+from anonymizer import MAX_EXPORT_BYTES, ExportError, export_anonymized_db
 from query_manager import QueryManager
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -147,6 +149,62 @@ def demo_download():
     if not os.path.isfile(DEMO_DB):
         return jsonify({"error": "演示库不存在"}), 404
     return send_file(DEMO_DB, as_attachment=True, download_name="demo_sensors.db")
+
+
+# ---------------- 代号化导出（外发脱敏） ----------------
+
+@app.post("/export")
+def export_db():
+    # 受理时刻即取定当前库路径：此后该会话即使上传替换或清除副本，
+    # 本次导出仍基于受理时的快照，不会混入另一版数据。
+    src_path = _current_db()
+    if not src_path:
+        return jsonify({"error": "尚未上传数据库副本，无法导出"}), 400
+    # 入口先做一次轻量受理校验，明确 10MB 上限；放在创建工作目录之前，
+    # 保证任何拒绝路径都不会留下工作目录。
+    size = os.path.getsize(src_path)
+    if size > MAX_EXPORT_BYTES:
+        return jsonify({
+            "error": f"仅支持不超过 10MB 的数据库（当前 {size / 1024 / 1024:.1f}MB），已拒绝导出"
+        }), 400
+
+    work_dir = os.path.abspath(
+        tempfile.mkdtemp(prefix="export-" + _ensure_uid()[:8] + "-", dir=UPLOAD_DIR)
+    )
+
+    def _remove_work_dir():
+        # 无论成功失败都销毁工作目录：失败时不留半成品，成功时下载完成即删。
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if os.path.isdir(work_dir):
+            app.logger.warning("导出工作目录未能删除：%s", work_dir)
+
+    try:
+        output_path, stats = export_anonymized_db(src_path, work_dir)
+    except ExportError as exc:
+        _remove_work_dir()
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        _remove_work_dir()
+        raise
+
+    # 只有全流程（快照/校验/改写/字节级复核）成功才会走到这里。
+    # send_file 构造响应时已打开文件句柄，after_this_request 中删除目录
+    # 不影响 WSGI 服务器继续读取（Linux 已打开句柄保留 inode），
+    # 磁盘上也不会保留成品副本。
+    def _cleanup(response):
+        _remove_work_dir()
+        return response
+
+    after_this_request(_cleanup)
+    resp = send_file(
+        output_path,
+        as_attachment=True,
+        download_name="sensors_coded.db",
+        mimetype="application/vnd.sqlite3",
+    )
+    resp.headers["X-Export-Sensors"] = str(stats["sensor_count"])
+    resp.headers["X-Export-Samples"] = str(stats["sample_count"])
+    return resp
 
 
 @app.post("/reset")
